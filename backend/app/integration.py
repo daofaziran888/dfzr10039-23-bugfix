@@ -14,17 +14,25 @@ from __future__ import annotations
 
 import random
 import re
+import threading
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
 from app.models import (
     AntiBlockStrategy, AntiType, ArchiveFormat, ArchivePolicy, CleanedContent,
     CleanRule, CostRecord, CrawlJobSpec, CrawlLimitRule, DeliveryFormat,
-    DeliveryTask, DiffRecord, ExtractRule, IncrCursor, ParseLogEntry,
-    ProxyNode, QualitySample, RawExtractedContent, SampleMethod,
+    DeliveryReceipt, DeliveryTask, DiffRecord, ExtractRule, IncrCursor,
+    ParseLogEntry, ProxyNode, QualitySample, RawExtractedContent, SampleMethod,
     SchedulePlan, SiteConfig, SiteType, StorageBatch, UrlFingerprint,
 )
+from app.services.batch_catalog import catalog
+from app.services.delivery_ledger import ledger
 from app.store import store
+
+
+# 默认接收仓库；同一批次版本可以分别投给多个目标，每个目标各留一份凭证。
+DEFAULT_TARGET_SYSTEM = "W1"
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +113,7 @@ def run_crawl_pipeline(site_row: dict[str, Any], job_row: dict[str, Any],
     batch.status = "校验通过" if all(c.is_valid() for c in cleaned) else "校验失败"
 
     _persist_batch(batch)
+    catalog.register(batch)
 
     return batch
 
@@ -277,63 +286,520 @@ def select_proxy_for_job(job: CrawlJobSpec) -> ProxyNode | None:
 # 流水线 4: batch_store → data_delivery → quality_sample
 # ---------------------------------------------------------------------------
 
-def deliver_and_sample(batch: StorageBatch) -> tuple[DeliveryTask | None, QualitySample | None]:
+@dataclass
+class DeliveryOutcome:
+    """一次投递的完整结果：任务、有效收讫凭证、抽样计划和对账状态。"""
+    task: DeliveryTask | None = None
+    receipt: DeliveryReceipt | None = None
+    sample: QualitySample | None = None
+    claimed: bool = False
+    reissued: bool = False
+    deduplicated: bool = False
+    reconciled: bool = False
+    intake_count: int = 0
+    pending: dict[str, Any] | None = None
+    message: str = ""
+    sample_message: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.receipt is not None and self.receipt.is_valid()
+
+
+# 同一批次版本并发提交时，串行化“查重 + 入仓 + 写回”这一段。
+_delivery_lock = threading.RLock()
+
+
+def _delivery_task_row(
+    batch: StorageBatch, target_system: str, version: str | None = None,
+) -> dict[str, Any] | None:
+    """按业务键找已有投递任务行，复用任务编号，避免台账重复。"""
+    batch_version = version or batch.batch_version
+    for row in store.rows("data_delivery"):
+        if (
+            str(row.get("批次关联") or row.get("数据来源")) == batch.batch_id
+            and str(row.get("批次版本") or "v1") == batch_version
+            and str(row.get("目标系统")) == target_system
+        ):
+            return row
+    return None
+
+
+def _deliver(
+    batch: StorageBatch,
+    target_system: str,
+    *,
+    submission_token: str = "",
+    interrupt_before: str | None = None,
+    reconcile_pending: bool = False,
+) -> DeliveryOutcome:
+    """批次版本投递到指定目标，全程以收讫台账判定投递资格。
+
+    `interrupt_before` 可取值：
+    - "receipt"：收到回执后、本地凭证写回前断开；
+    - "task"：凭证已写回、投递任务写回前断开。
+
+    全程串行化：查重、入仓、写凭证、写任务、抽样是一个事务；恢复任务与定时
+    执行同时进来时，后到的一方只能看到前一方写好的有效凭证，从而复用而不是
+    再领一份投递资格。
+    """
+    outcome = DeliveryOutcome()
+    token = submission_token or _submission_token(batch, target_system)
+
+    if batch.status != "校验通过":
+        _record_failed_delivery(batch, target_system, outcome)
+        return outcome
+
+    with _delivery_lock:
+        if reconcile_pending:
+            outcome.reconciled = ledger.reconcile(batch, target_system) is not None
+
+        receipt, claim_message = ledger.claim(
+            batch=batch, target_system=target_system,
+            submission_token=token, persist=False)
+        if receipt is None:
+            outcome.message = "接收仓库未确认，投递保持待对账"
+            return outcome
+
+        outcome.intake_count = 1 if ledger.warehouse_has_version(
+            batch.batch_id, batch.batch_version, target_system) else 0
+        outcome.reissued = claim_message in ("补全凭证", "补发收执")
+        outcome.deduplicated = outcome.reissued and claim_message == "补全凭证"
+        # 只有首次入仓的提交才拿到新的投递资格；复用/补全都不是新资格。
+        outcome.claimed = claim_message == "待确认"
+
+        (outcome.receipt, outcome.task, outcome.sample,
+         outcome.pending, message) = _writeback(
+            batch, target_system, receipt, token, interrupt_before)
+        outcome.message = message
+        if outcome.sample is not None:
+            outcome.sample_message = "已登记"
+
+        if claim_message == "补发收执" and outcome.receipt is not None:
+            outcome.message = "接收仓库已入仓该版本，补发收执并复用投递任务"
+        elif outcome.deduplicated and outcome.receipt is not None:
+            outcome.message = "接收仓库已入仓该版本，只补全本地凭证，未重复入仓"
+        return outcome
+
+
+def _writeback(
+    batch: StorageBatch,
+    target_system: str,
+    receipt: DeliveryReceipt,
+    token: str,
+    interrupt_before: str | None,
+) -> tuple[
+    DeliveryReceipt | None, DeliveryTask | None, QualitySample | None,
+    dict[str, Any] | None, str,
+]:
+    """把一次投递的收讫结果写回本地：凭证 → 任务 → 抽样。
+
+    任一步被中断都返回已完成的部分并留下待对账进度；远端入仓事实不受影响，
+    恢复任务核对后会用同一份凭证把剩余写回补全。
+    """
+    if interrupt_before == "receipt":
+        progress = _record_pending(batch, target_system, token, "receipt_writeback")
+        return None, None, None, progress, "已收到回执，本地凭证写回中断，等待对账"
+
+    ledger.persist_receipt(receipt)
+
+    row = _delivery_task_row(batch, target_system)
+    task = DeliveryTask(
+        task_id=(str(row.get("任务编号")) if row
+                 else f"DEL-{batch.batch_id}-{target_system}"),
+        data_source=batch.batch_id,
+        target_system=target_system,
+        delivery_format=DeliveryFormat.CSV,
+        frequency=str(row.get("投递频率", "manual")) if row else "manual",
+        partition_strategy=str(row.get("分区策略", "by_date")) if row else "by_date",
+        batch_ref_id=batch.batch_id,
+        batch_version=batch.batch_version,
+    )
+    if not ledger.register_task(task, receipt, interrupt_before=interrupt_before):
+        progress = _record_pending(batch, target_system, token, "task_writeback")
+        return receipt, None, None, progress, "已收到回执，本地任务写回中断，等待对账"
+
+    _persist_delivery_row(task, batch, receipt)
+    _mark_pending_resolved(batch, target_system)
+
+    # 抽样从同一份有效收讫凭证取数，登记接收方实际入仓的版本。
+    sample, _ = ledger.bind_sample(
+        batch, target_system,
+        make_sample=lambda rcpt: _make_sample(batch, rcpt),
+        adopt_existing=_adopt_existing_sample,
+    )
+    if sample is not None:
+        _run_sample_check(batch, sample)
+        _persist_sample_row(sample)
+
+    return receipt, task, sample, None, f"投递完成，凭证 {receipt.receipt_id}"
+
+
+def _submission_token(batch: StorageBatch, target_system: str) -> str:
+    return f"{batch.batch_id}@{batch.batch_version}->{target_system}"
+
+
+def _record_pending(
+    batch: StorageBatch, target_system: str, token: str, stage: str,
+) -> dict[str, Any]:
+    progress = ledger.record_pending(
+        batch=batch, target_system=target_system,
+        submission_token=token, stage=stage,
+    )
+    _persist_pending_row(batch, target_system, stage)
+    return progress
+
+
+def _record_failed_delivery(
+    batch: StorageBatch, target_system: str, outcome: DeliveryOutcome,
+) -> None:
+    """校验失败的批次不产生收讫凭证，只把失败结果记到投递台账上。"""
+    row = _delivery_task_row(batch, target_system)
+    task = DeliveryTask(
+        task_id=(str(row.get("任务编号")) if row
+                 else f"DEL-{batch.batch_id}-{target_system}"),
+        data_source=batch.batch_id,
+        target_system=target_system,
+        delivery_format=DeliveryFormat.CSV,
+        frequency=str(row.get("投递频率", "manual")) if row else "manual",
+        partition_strategy=str(row.get("分区策略", "by_date")) if row else "by_date",
+        last_delivery=datetime.now(timezone.utc).isoformat(),
+        status="投递失败",
+        batch_ref_id=batch.batch_id,
+        batch_version=batch.batch_version,
+        delivered_row_count=0,
+    )
+    _persist_delivery_row(task, batch, None)
+    outcome.task = task
+    outcome.message = f"批次{batch.status}，不允许投递"
+
+def deliver_to_target(
+    batch: StorageBatch,
+    target_system: str,
+    *,
+    submission_token: str = "",
+    interrupt_before: str | None = None,
+) -> DeliveryOutcome:
+    """把批次版本投递到指定目标仓库，并同步抽样。"""
+    catalog.register(batch)
+    return _deliver(
+        batch, target_system,
+        submission_token=submission_token,
+        interrupt_before=interrupt_before,
+    )
+
+
+def retry_delivery(
+    batch: StorageBatch,
+    target_system: str = DEFAULT_TARGET_SYSTEM,
+    *,
+    submission_token: str = "",
+) -> DeliveryOutcome:
+    """投递重试：已有成功凭证直接复用，未确认的进度先对账再补发收执。"""
+    return _deliver(
+        batch, target_system,
+        submission_token=submission_token,
+        reconcile_pending=True,
+    )
+
+
+def recover_delivery(
+    batch: StorageBatch,
+    target_system: str = DEFAULT_TARGET_SYSTEM,
+    *,
+    submission_token: str = "",
+) -> DeliveryOutcome:
+    """恢复中断的投递：先按待对账进度对账，再走幂等投递资格。
+
+    两个恢复执行同时进来时，后到的一方只能看到前一方写好的有效凭证，
+    不会重复入仓、也不会在投递台账里留下第二个编号。
+    """
+    return _deliver(
+        batch, target_system,
+        submission_token=submission_token,
+        reconcile_pending=True,
+    )
+
+
+def backfill_receipt(
+    receipt_id: str,
+    target_system: str = DEFAULT_TARGET_SYSTEM,
+) -> dict[str, Any] | None:
+    """接收仓库按入仓事实补发收执，供投递回执详情页对账。"""
+    return ledger.reissue_receipt(receipt_id)
+
+
+def receipt_detail(
+    batch: StorageBatch,
+    target_system: str = DEFAULT_TARGET_SYSTEM,
+) -> dict[str, Any] | None:
+    """投递回执详情：目标只入仓一次，凭证与任务一一对应。
+
+    本地写回中断时凭证可能还没入台账，但接收仓库的入仓事实与待对账进度
+    仍然可查，详情页据此显示“待对账”，恢复任务补全后再变成“已收讫”。
+    """
+    receipt = ledger.receipt_for(batch.batch_id, batch.batch_version, target_system)
+    pending = ledger.pending_for(batch.batch_id, batch.batch_version, target_system)
+    intake = ledger.warehouse_version(
+        batch.batch_id, batch.batch_version, target_system)
+    if receipt is None and pending is None and intake is None:
+        return None
+    task = ledger.task_for(batch.batch_id, batch.batch_version, target_system)
+    sample = ledger.sample_for(batch.batch_id, batch.batch_version, target_system)
+    return {
+        "batch_id": batch.batch_id,
+        "batch_version": batch.batch_version,
+        "target_system": target_system,
+        "receipt_id": receipt.receipt_id if receipt else "",
+        "receipt_status": receipt.status if receipt else "待确认",
+        "reconciliation_status": (
+            receipt.reconciliation_status if receipt else "待对账"),
+        "claim_status": ledger.claim_status(
+            batch.batch_id, batch.batch_version, target_system),
+        "reissue_count": receipt.reissue_count if receipt else 0,
+        "intake_count": 1 if intake else 0,
+        "received_at": receipt.received_at if receipt else "",
+        "delivered_row_count": receipt.delivered_row_count if receipt else 0,
+        "task_id": task.task_id if task else "",
+        "task_count": 1 if task else 0,
+        "pending_stage": (pending or {}).get("stage", ""),
+        "sample": _sample_payload(sample),
+    }
+
+
+def sample_workbench(
+    batch_id: str, batch_version: str = "v1",
+) -> list[dict[str, Any]]:
+    """抽样工作台：每个有效收讫凭证对应一个样本，登记的数据版本可追溯。"""
+    workbench: list[dict[str, Any]] = []
+    for receipt in ledger.receipts_for_batch(batch_id, batch_version):
+        if not receipt.is_valid():
+            continue
+        sample = ledger.sample_for(
+            batch_id, receipt.batch_version, receipt.target_system)
+        workbench.append({
+            "target_system": receipt.target_system,
+            "receipt_id": receipt.receipt_id,
+            "data_version": sample.data_version if sample else receipt.batch_version,
+            "plan_id": sample.plan_id if sample else "",
+            "sample_size": sample.sample_size if sample else 0,
+            "check_result": sample.check_result if sample else "",
+            "status": sample.status if sample else "待采样",
+        })
+    return workbench
+
+
+def delivery_trail(batch_id: str, batch_version: str = "v1") -> list[dict[str, Any]]:
+    """一个批次版本投过的所有目标：每个目标一份凭证、一条任务。"""
+    trail: list[dict[str, Any]] = []
+    for receipt in ledger.receipts_for_batch(batch_id, batch_version):
+        task = ledger.task_for(batch_id, receipt.batch_version, receipt.target_system)
+        sample = ledger.sample_for(
+            batch_id, receipt.batch_version, receipt.target_system)
+        trail.append({
+            "target_system": receipt.target_system,
+            "batch_version": receipt.batch_version,
+            "receipt_id": receipt.receipt_id,
+            "receipt_status": receipt.status,
+            "reissue_count": receipt.reissue_count,
+            "task_id": task.task_id if task else "",
+            "sample_plan_id": sample.plan_id if sample else "",
+            "data_version": sample.data_version if sample else "",
+        })
+    return trail
+
+
+def deliver_and_sample(
+    batch: StorageBatch,
+    target_system: str = DEFAULT_TARGET_SYSTEM,
+) -> tuple[DeliveryTask | None, QualitySample | None]:
     """从批次存储投递数据，并对投递结果进行质量抽样。"""
-    # 数据投递
-    delivery_rows = [r for r in store.rows("data_delivery")
-                     if r.get("数据来源") == batch.batch_id or r.get("状态") == "待投递"]
-    if delivery_rows:
-        dt = DeliveryTask.from_seed_row(delivery_rows[0])
-        dt.batch_ref_id = batch.batch_id
-        dt.delivered_row_count = batch.row_count
-        dt.last_delivery = datetime.now(timezone.utc).isoformat()
-        dt.status = "已完成" if batch.status == "校验通过" else "投递失败"
-        _persist_delivery(dt)
+    catalog.register(batch)
+    outcome = deliver_to_target(batch, target_system)
+    return outcome.task, outcome.sample
+
+
+def _make_sample(batch: StorageBatch, receipt: DeliveryReceipt) -> QualitySample:
+    """以有效收讫凭证为准创建抽样计划，样本量按实际入仓行数计算。"""
+    row_count = receipt.delivered_row_count or batch.row_count
+    sample_size = max(1, int(row_count * 0.1)) if row_count > 0 else 0
+    return QualitySample(
+        plan_id=f"QS-{batch.batch_id}-{receipt.target_system}-{receipt.batch_version}",
+        target_batch=batch.batch_id,
+        sample_ratio=0.1,
+        sample_method=SampleMethod.RANDOM,
+        sample_size=sample_size,
+        last_sampled=datetime.now(timezone.utc).isoformat(),
+        status="待采样",
+        target_system=receipt.target_system,
+        receipt_id=receipt.receipt_id,
+        data_version=receipt.batch_version,
+        delivery_task_id=receipt.task_id,
+    )
+
+
+def _adopt_existing_sample(receipt: DeliveryReceipt) -> QualitySample | None:
+    """复用重试前已经存在的抽样计划，保证旧计划仍能查到。"""
+    for row in store.rows("quality_sample"):
+        if str(row.get("目标批次")) != receipt.batch_id:
+            continue
+        row_target = str(row.get("目标系统") or "")
+        row_version = str(row.get("数据版本") or "")
+        if row_target not in ("", receipt.target_system):
+            continue
+        if row_version not in ("", receipt.batch_version):
+            continue
+        sample = QualitySample.from_seed_row(row)
+        sample.target_system = receipt.target_system
+        sample.receipt_id = receipt.receipt_id
+        sample.data_version = receipt.batch_version
+        sample.status = "待采样"
+        sample.check_result = ""
+        return sample
+    return None
+
+
+def _run_sample_check(batch: StorageBatch, qs: QualitySample) -> None:
+    """从凭证记录的入仓数据里抽样校验。"""
+    receipt = ledger.receipt_for(qs.target_batch, qs.data_version, qs.target_system)
+    pool = list(receipt.records) if receipt is not None else list(batch.records)
+    if not pool or qs.sample_size <= 0:
+        qs.status = "待采样"
+        return
+    sampled = random.sample(pool, min(qs.sample_size, len(pool)))
+    valid_count = sum(1 for s in sampled if s.is_valid())
+    actual_ratio = valid_count / len(sampled) if sampled else 0
+    qs.check_result = f"抽样{len(sampled)}条，有效{valid_count}条（数据版本{qs.data_version}）"
+    if batch.status != "校验通过" or actual_ratio < (1 - qs.deviation_threshold):
+        qs.status = "偏差告警"
     else:
-        # 自动创建投递任务
-        dt = DeliveryTask(
-            task_id=f"DEL-{batch.batch_id}",
-            data_source=batch.batch_id,
-            target_system=f"data_warehouse_{batch.source_job_id}",
-            delivery_format=DeliveryFormat.CSV,
-            frequency="manual",
-            partition_strategy="by_date",
-            batch_ref_id=batch.batch_id,
-            delivered_row_count=batch.row_count,
-            last_delivery=datetime.now(timezone.utc).isoformat(),
-            status="已完成" if batch.status == "校验通过" else "投递失败",
+        qs.status = "已通过"
+
+
+def _sample_payload(qs: QualitySample | None) -> dict[str, Any] | None:
+    if qs is None:
+        return None
+    return {
+        "plan_id": qs.plan_id,
+        "target_batch": qs.target_batch,
+        "target_system": qs.target_system,
+        "receipt_id": qs.receipt_id,
+        "data_version": qs.data_version,
+        "delivery_task_id": qs.delivery_task_id,
+        "sample_size": qs.sample_size,
+        "check_result": qs.check_result,
+        "status": qs.status,
+    }
+
+
+def _persist_delivery_row(
+    task: DeliveryTask, batch: StorageBatch, receipt: DeliveryReceipt | None,
+) -> None:
+    """按业务键写回投递台账：已有任务行就更新，绝不追加重复编号。"""
+    rows = store.rows("data_delivery")
+    target_system = receipt.target_system if receipt else task.target_system
+    row = _delivery_task_row(batch, target_system)
+    payload = {
+        "任务编号": task.task_id,
+        "数据来源": batch.batch_id,
+        "目标系统": target_system,
+        "投递格式": task.delivery_format.value,
+        "投递频率": task.frequency,
+        "分区策略": task.partition_strategy,
+        "最近投递": task.last_delivery,
+        "投递状态": task.status,
+        "status": task.status,
+        "pending": False,
+        "abnormal": task.status == "投递失败",
+        "批次关联": batch.batch_id,
+        "批次版本": batch.batch_version,
+        "投递行数": task.delivered_row_count,
+        "收讫凭证": receipt.receipt_id if receipt else "",
+    }
+    if row is not None:
+        row.update(payload)
+        row["id"] = int(row.get("id", 0))
+        return
+    rows.append({
+        "id": max((int(r.get("id", 0)) for r in rows), default=0) + 1,
+        **payload,
+    })
+
+
+def _persist_pending_row(
+    batch: StorageBatch, target_system: str, stage: str,
+) -> None:
+    """未确认的投递进度写入投递台账，状态为待对账，不占有效凭证。"""
+    rows = store.rows("data_delivery")
+    row = _delivery_task_row(batch, target_system)
+    payload = {
+        "任务编号": f"DEL-{batch.batch_id}-{target_system}",
+        "数据来源": batch.batch_id,
+        "目标系统": target_system,
+        "投递格式": DeliveryFormat.CSV.value,
+        "投递频率": "manual",
+        "分区策略": "by_date",
+        "最近投递": datetime.now(timezone.utc).isoformat(),
+        "投递状态": "待对账",
+        "status": "待对账",
+        "pending": True,
+        "abnormal": False,
+        "批次关联": batch.batch_id,
+        "批次版本": batch.batch_version,
+        "投递行数": batch.row_count,
+        "收讫凭证": "",
+        "待对账阶段": stage,
+    }
+    if row is not None:
+        row.update(payload)
+        return
+    rows.append({
+        "id": max((int(r.get("id", 0)) for r in rows), default=0) + 1,
+        **payload,
+    })
+
+
+def _mark_pending_resolved(batch: StorageBatch, target_system: str) -> None:
+    """对账完成后清掉台账上的待对账标记。"""
+    row = _delivery_task_row(batch, target_system)
+    if row is not None:
+        row["待对账阶段"] = ""
+
+
+def _persist_sample_row(qs: QualitySample) -> None:
+    """按 (批次, 目标, 版本) 写回抽样清单，重试时更新已有计划。"""
+    rows = store.rows("quality_sample")
+    payload = {
+        "计划编号": qs.plan_id,
+        "目标批次": qs.target_batch,
+        "抽样比例": str(qs.sample_ratio),
+        "抽样方式": qs.sample_method.value,
+        "样本数量": qs.sample_size,
+        "检验结果": qs.check_result,
+        "偏差阈值": str(qs.deviation_threshold),
+        "最近采样": qs.last_sampled,
+        "status": qs.status,
+        "pending": False,
+        "abnormal": qs.status == "偏差告警",
+        "目标系统": qs.target_system,
+        "收讫凭证": qs.receipt_id,
+        "数据版本": qs.data_version,
+        "投递任务编号": qs.delivery_task_id,
+    }
+    for row in rows:
+        same_plan = str(row.get("计划编号")) == qs.plan_id
+        same_scope = (
+            str(row.get("目标系统") or "") == qs.target_system
+            and str(row.get("数据版本") or qs.data_version) == qs.data_version
         )
-        _persist_delivery(dt)
-
-    # 质量抽样
-    sample_rows = [r for r in store.rows("quality_sample")
-                   if r.get("目标批次") == batch.batch_id]
-    if sample_rows:
-        qs = QualitySample.from_seed_row(sample_rows[0])
-    else:
-        # 自动创建抽样计划
-        sample_size = max(1, int(batch.row_count * 0.1))
-        qs = QualitySample(
-            plan_id=f"QS-{batch.batch_id}",
-            target_batch=batch.batch_id,
-            sample_ratio=0.1,
-            sample_method=SampleMethod.RANDOM,
-            sample_size=sample_size,
-            last_sampled=datetime.now(timezone.utc).isoformat(),
-            status="已通过" if batch.status == "校验通过" else "偏差告警",
-        )
-        _persist_sample(qs)
-
-    # 从批次中随机抽取 sample_size 条记录进行校验
-    if batch.records and qs.sample_size > 0:
-        sampled = random.sample(batch.records, min(qs.sample_size, len(batch.records)))
-        valid_count = sum(1 for s in sampled if s.is_valid())
-        actual_ratio = valid_count / len(sampled) if sampled else 0
-        qs.check_result = f"抽样{len(sampled)}条，有效{valid_count}条"
-        if actual_ratio < (1 - qs.deviation_threshold):
-            qs.status = "偏差告警"
-
-    return dt, qs
+        if same_plan or (
+                str(row.get("目标批次")) == qs.target_batch and same_scope):
+            row.update(payload)
+            return
+    rows.append({
+        "id": max((int(r.get("id", 0)) for r in rows), default=0) + 1,
+        **payload,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -560,7 +1026,9 @@ def _persist_batch(batch: StorageBatch) -> None:
         "存储路径": batch.storage_path,
         "压缩格式": batch.compression,
         "Schema版本": batch.schema_version,
+        "批次版本": batch.batch_version,
         "校验摘要": batch.checksum[:16],
+        "完整校验摘要": batch.checksum,
         "入库时间": batch.stored_at,
         "status": batch.status,
         "pending": False,
@@ -601,33 +1069,6 @@ def _persist_parse_log(log: ParseLogEntry) -> None:
         "status": "成功" if not log.error_type else "格式异常",
         "pending": False,
         "abnormal": bool(log.error_type),
-    })
-
-
-def _persist_delivery(dt: DeliveryTask) -> None:
-    rows = store.rows("data_delivery")
-    rows.append(dict(
-        id=max((int(r.get("id", 0)) for r in rows), default=0) + 1,
-        **{f: (getattr(dt, k) if not isinstance(getattr(dt, k), DeliveryFormat) else getattr(dt, k).value) for f, k in [
-            ("任务编号", "task_id"), ("数据来源", "data_source"),
-            ("目标系统", "target_system"), ("投递格式", "delivery_format"),
-            ("投递频率", "frequency"), ("分区策略", "partition_strategy"),
-            ("最近投递", "last_delivery"), ("投递状态", "status"),
-        ]},
-        status=dt.status, pending=False, abnormal=dt.status == "投递失败",
-    ))
-
-
-def _persist_sample(qs: QualitySample) -> None:
-    rows = store.rows("quality_sample")
-    rows.append({
-        "id": max((int(r.get("id", 0)) for r in rows), default=0) + 1,
-        "计划编号": qs.plan_id, "目标批次": qs.target_batch,
-        "抽样比例": str(qs.sample_ratio), "抽样方式": qs.sample_method.value,
-        "样本数量": qs.sample_size, "检验结果": qs.check_result,
-        "偏差阈值": str(qs.deviation_threshold), "最近采样": qs.last_sampled,
-        "status": qs.status, "pending": False,
-        "abnormal": qs.status == "偏差告警",
     })
 
 

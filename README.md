@@ -61,8 +61,7 @@ npm run dev
 | 增量采集 | `incr_crawl` | 增量标记 | 标记编号、目标站点、增量字段 |
 | 解析日志 | `parse_log` | 解析记录 | 记录编号、来源URL、解析规则 |
 | 数据投递 | `data_delivery` | 投递任务 | 任务编号、数据来源、目标系统 |
-| 质量抽样 | `quality_sample` | 抽样计划 | 计划编号、目标批次、抽样比例 |
-| 站点监控 | `site_monitor` | 监控指标 | 指标编号、目标站点、监控类型 |
+| 质量抽样 | `quality_sample` | 抽样计划 | 计划编号、目标批次、抽样比例 || 站点监控 | `site_monitor` | 监控指标 | 指标编号、目标站点、监控类型 |
 | 验证码识别 | `robot_verify` | 识别记录 | 记录编号、目标站点、验证码类型 |
 | 采集限速 | `crawl_limit` | 限速策略 | 策略编号、目标站点、请求间隔 |
 | 模板库 | `template_lib` | 采集模板 | 模板编号、站点类型、模板名称 |
@@ -80,6 +79,36 @@ npm run dev
   `frontend/src/domain/<模块>.ts`，用于承载真实业务差异并维持36题位容量。
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
+
+## 采集数据投递链路
+
+投递链路以“收讫台账”为准，批次版本在一个目标系统上只保留一份有效收讫凭证。
+
+- `app/services/delivery_ledger.py`：投递资格、接收仓库幂等入仓、收执补发、
+  待对账进度与抽样绑定的唯一判定处；业务键是
+  `(批次编号, 批次版本, 目标系统)`。
+- `app/integration.py`：`deliver_to_target` / `retry_delivery` /
+  `recover_delivery` / `receipt_detail` / `sample_workbench` /
+  `delivery_trail`。投递重试复用已有成功凭证；本地写回中断会留下“待对账”
+  进度，恢复任务先向接收仓库核对再补全同一份凭证。
+- `app/routers/delivery.py`：`/api/delivery/{批次}/{版本}/...` 提供回执详情、
+  目标轨迹、抽样工作台和投递/重试/恢复/补发收执动作。
+- 前端 `/delivery_receipt`：投递回执详情与抽样工作台，可核对每个目标的入仓
+  次数、收讫凭证和样本数据版本。
+
+演示数据 `B-A@v1` 已在校验通过状态，起服务后可直接投递到 `W1`、`W2`：
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/delivery/B-A/v1/targets/W1/actions \
+  -H 'Content-Type: application/json' -d '{"action":"投递"}'
+curl http://127.0.0.1:8000/api/delivery/B-A/v1/targets/W1
+curl http://127.0.0.1:8000/api/delivery/B-A/v1/trail
+curl http://127.0.0.1:8000/api/delivery/B-A/v1/samples
+```
+
+模拟“回执后本地写回中断”：同一动作带上 `"interrupt_before": "receipt"`，
+之后调用 `恢复投递`（或同时启动两个恢复执行）即可验证接收仓库只入仓一次、
+本地只落一份凭证与一条投递任务。
 
 领域：数据工程
 子方向：数据采集、爬虫与RPA

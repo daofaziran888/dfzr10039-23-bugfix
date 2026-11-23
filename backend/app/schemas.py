@@ -29,3 +29,11 @@ class EntryPayload(BaseModel):
 class ActionPayload(BaseModel):
     action: str
     remark: str | None = None
+
+
+class DeliveryActionPayload(BaseModel):
+    """投递动作：动作名 + 幂等提交凭据 + 可选的故障注入点。"""
+    action: str
+    submission_token: str | None = None
+    interrupt_before: str | None = None
+    remark: str | None = None

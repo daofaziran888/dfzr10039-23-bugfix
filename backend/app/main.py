@@ -10,9 +10,12 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.routers import ROUTERS
+from app.services.batch_catalog import ensure_demo_batches
 from app.store import store
 
 app = FastAPI(title="虫巢工坊 · 分布式爬虫调度与反爬对抗平台", version="1.0.0")
+
+ensure_demo_batches()
 
 app.add_middleware(
     CORSMiddleware,

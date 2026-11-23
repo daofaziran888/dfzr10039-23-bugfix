@@ -308,6 +308,9 @@ class StorageBatch:
     stored_at: str = ""
     status: str = "采集中"
     records: list[CleanedContent] = field(default_factory=list)
+    # 批次数据版本：同一批次编号可以按版本重复投递，投递台账以
+    # (批次编号, 批次版本, 目标系统) 作为唯一业务键。
+    batch_version: str = "v1"
 
     @classmethod
     def from_seed_row(cls, row: dict[str, Any]) -> StorageBatch:
@@ -318,9 +321,10 @@ class StorageBatch:
             storage_path=str(row.get("存储路径", "")),
             compression=str(row.get("压缩格式", "gzip")),
             schema_version=str(row.get("Schema版本", "v1")),
-            checksum=str(row.get("校验摘要", "")),
+            checksum=str(row.get("完整校验摘要") or row.get("校验摘要", "")),
             stored_at=str(row.get("入库时间", "")),
             status=str(row.get("status", "采集中")),
+            batch_version=str(row.get("批次版本") or "v1"),
         )
 
     def compute_checksum(self) -> str:
@@ -330,7 +334,11 @@ class StorageBatch:
 
 @dataclass
 class DeliveryTask:
-    """数据投递任务：data_delivery 管理，从 batch_store 读取批次投递。"""
+    """数据投递任务：data_delivery 管理，从 batch_store 读取批次投递。
+
+    一个批次版本投给一个目标系统只对应一条任务记录；重复投递/重试都复用
+    这条记录，避免投递台账出现重复的任务编号。
+    """
     task_id: str
     data_source: str
     target_system: str
@@ -341,6 +349,8 @@ class DeliveryTask:
     status: str = "待投递"
     batch_ref_id: str = ""
     delivered_row_count: int = 0
+    batch_version: str = ""
+    receipt_id: str = ""
 
     @classmethod
     def from_seed_row(cls, row: dict[str, Any]) -> DeliveryTask:
@@ -358,12 +368,76 @@ class DeliveryTask:
             partition_strategy=str(row.get("分区策略", "")),
             last_delivery=str(row.get("最近投递", "")),
             status=str(row.get("status", "待投递")),
+            batch_ref_id=str(row.get("批次关联", row.get("数据来源", ""))),
+            delivered_row_count=int(row.get("投递行数", 0) or 0),
+            batch_version=str(row.get("批次版本") or ""),
+            receipt_id=str(row.get("收讫凭证") or ""),
+        )
+
+
+@dataclass
+class DeliveryReceipt:
+    """收讫凭证：接收方仓库对一个批次版本在某个目标系统上的入仓确认。
+
+    业务唯一键是 (batch_id, batch_version, target_system)：无论投递重试、
+    本地写回中断后的恢复还是并发提交，同一份批次版本在一个目标上只保留
+    一份有效凭证。
+    """
+    receipt_id: str
+    batch_id: str
+    batch_version: str
+    target_system: str
+    delivered_row_count: int = 0
+    checksum: str = ""
+    received_at: str = ""
+    status: str = "已收讫"
+    task_id: str = ""
+    reissue_count: int = 0
+    reconciliation_status: str = "已对账"
+    submission_token: str = ""
+    records: list[CleanedContent] = field(default_factory=list)
+
+    @property
+    def business_key(self) -> tuple[str, str, str]:
+        return (self.target_system, self.batch_id, self.batch_version)
+
+    def is_valid(self) -> bool:
+        """只有已完成收讫、且对账结论一致时才是有效凭证。"""
+        return self.status == "已收讫" and bool(self.receipt_id)
+
+    @classmethod
+    def from_seed_row(cls, row: dict[str, Any]) -> DeliveryReceipt:
+        try:
+            count = int(row.get("数据行数", 0) or 0)
+        except (ValueError, TypeError):
+            count = 0
+        try:
+            reissue = int(row.get("补发次数", 0) or 0)
+        except (ValueError, TypeError):
+            reissue = 0
+        return cls(
+            receipt_id=str(row.get("凭证编号", "")),
+            batch_id=str(row.get("批次编号", "")),
+            batch_version=str(row.get("批次版本") or "v1"),
+            target_system=str(row.get("目标系统", "")),
+            delivered_row_count=count,
+            checksum=str(row.get("校验摘要", "")),
+            received_at=str(row.get("接收时间", "")),
+            status=str(row.get("收讫状态", row.get("status", "已收讫"))),
+            task_id=str(row.get("投递任务编号", "")),
+            reissue_count=reissue,
+            reconciliation_status=str(row.get("对账状态", "已对账")),
+            submission_token=str(row.get("提交凭据", "")),
         )
 
 
 @dataclass
 class QualitySample:
-    """质量抽样计划：quality_sample 管理，从 batch_store 提取样本检测。"""
+    """质量抽样计划：quality_sample 管理，从批次存储提取样本检测。
+
+    抽样必须绑定一份有效收讫凭证，样本登记的数据版本取接收方实际入仓
+    的批次版本，而不是本地投递意图中的版本。
+    """
     plan_id: str
     target_batch: str
     sample_ratio: float
@@ -373,6 +447,10 @@ class QualitySample:
     deviation_threshold: float = 0.05
     last_sampled: str = ""
     status: str = "待采样"
+    target_system: str = ""
+    receipt_id: str = ""
+    data_version: str = ""
+    delivery_task_id: str = ""
 
     @classmethod
     def from_seed_row(cls, row: dict[str, Any]) -> QualitySample:
@@ -404,7 +482,12 @@ class QualitySample:
             deviation_threshold=dt,
             last_sampled=str(row.get("最近采样", "")),
             status=str(row.get("status", "待采样")),
+            target_system=str(row.get("目标系统", "") or ""),
+            receipt_id=str(row.get("收讫凭证", "") or ""),
+            data_version=str(row.get("数据版本", "") or ""),
+            delivery_task_id=str(row.get("投递任务编号", "") or ""),
         )
+
 
 
 @dataclass
